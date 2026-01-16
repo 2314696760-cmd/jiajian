@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>JiaJianAI Piano - Maestro Edition</title>
+    <title>JiaJianAI Piano - Ultimate Mobile</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
@@ -280,6 +280,24 @@
         @keyframes rotate { from {transform: rotate(0deg);} to {transform: rotate(360deg);} }
         @keyframes breathe { 0% {transform: scale(1);} 50% {transform: scale(1.05);} 100% {transform: scale(1);} }
         .hidden { display: none !important; }
+
+        /* --- 校准界面样式 --- */
+        #calibration-overlay {
+            position: fixed; inset: 0; z-index: 99999;
+            background: radial-gradient(circle at center, #0f172a, #000);
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            transition: opacity 1s ease-out;
+        }
+        #calibration-overlay.hidden-fade { opacity: 0; pointer-events: none; }
+        .cali-title { font-family: 'Cinzel', serif; font-size: 2.5rem; color: var(--gold-accent); margin-bottom: 1rem; text-shadow: 0 0 20px rgba(255,215,0,0.5); }
+        .cali-step-text { font-size: 1.2rem; color: #fff; margin-bottom: 2rem; font-family: 'Noto Serif SC', serif; }
+        .cali-visualizer { width: 200px; height: 200px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.1); display: flex; align-items: center; justify-content: center; position: relative; transition: all 0.3s; }
+        .cali-circle { width: 100px; height: 100px; border-radius: 50%; background: var(--gold-accent); opacity: 0.5; transform: scale(0.5); transition: all 0.1s; box-shadow: 0 0 30px var(--gold-accent); }
+        .cali-btn { margin-top: 3rem; padding: 12px 40px; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); border-radius: 99px; color: #fff; font-size: 14px; cursor: pointer; transition: 0.3s; }
+        .cali-btn:hover { background: var(--gold-accent); color: #000; box-shadow: 0 0 20px var(--gold-glow); }
+        .cali-progress { position: absolute; bottom: 50px; display: flex; gap: 8px; }
+        .cali-dot { width: 8px; height: 8px; border-radius: 50%; background: #333; transition: 0.3s; }
+        .cali-dot.active { background: var(--gold-accent); box-shadow: 0 0 8px var(--gold-accent); }
     </style>
 </head>
 <body>
@@ -287,10 +305,33 @@
 <canvas id="star-canvas"></canvas>
 <div id="toast" class="toast">提示信息</div>
 
-<!-- 1. 录音中全屏提示弹窗 (含实时示波器) -->
+<!-- 校准遮罩 -->
+<div id="calibration-overlay">
+    <div class="cali-title">声律对齐</div>
+    <div class="cali-step-text" id="cali-text">点击开始校准模型</div>
+    
+    <div class="cali-visualizer" id="cali-vis">
+        <div class="cali-circle" id="cali-circle"></div>
+    </div>
+    
+    <button class="cali-btn" id="cali-action-btn" onclick="startCalibration()">开始校准</button>
+    
+    <div class="cali-progress">
+        <div class="cali-dot" id="dot-0"></div>
+        <div class="cali-dot" id="dot-1"></div>
+        <div class="cali-dot" id="dot-2"></div>
+        <div class="cali-dot" id="dot-3"></div>
+        <div class="cali-dot" id="dot-4"></div>
+        <div class="cali-dot" id="dot-5"></div>
+        <div class="cali-dot" id="dot-6"></div>
+    </div>
+</div>
+
+<!-- 1. 录音中全屏提示弹窗 -->
 <div id="recording-hint-overlay">
-    <div class="text-2xl font-serif text-yellow-100 mb-2 tracking-wider text-center px-6 leading-relaxed">
-        慢慢哼唱<br><span class="text-yellow-400 font-bold text-3xl mt-2 block">感受当下</span>
+    <div id="dynamic-hint-container" class="transition-opacity duration-500 text-center px-6 leading-relaxed min-h-[80px] flex flex-col justify-center items-center">
+        <div class="text-2xl font-serif text-yellow-100 mb-2 tracking-wider">慢慢哼唱</div>
+        <div class="text-yellow-400 font-bold text-3xl mt-2 block">感受当下</div>
     </div>
     
     <!-- Canvas 示波器 -->
@@ -330,7 +371,7 @@
     <div id="processing-text" class="mt-4 text-gray-400 text-xs tracking-wider">正在分析音频特征...</div>
 </div>
 
-<div class="main-layout">
+<div class="main-layout blurred" id="main-layout">
     <div class="glass-panel">
         <div class="player-wrapper">
             <div class="header-section interactive-hover">
@@ -421,6 +462,134 @@
 </div>
 
 <script>
+    // --- 0. Calibration Logic ---
+    let caliStep = 0;
+    const CALI_NOTES = ["哆 (Do)", "来 (Re)", "咪 (Mi)", "发 (Fa)", "嗦 (Sol)", "拉 (La)", "西 (Si)"];
+    let caliStream = null;
+    let caliContext = null;
+    let caliAnalyser = null;
+    let caliAnimFrame = null;
+    let noteStableCount = 0;
+    
+    async function startCalibration() {
+        try {
+            document.getElementById('cali-action-btn').style.display = 'none';
+            caliStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false } });
+            
+            caliContext = new (window.AudioContext || window.webkitAudioContext)();
+            const source = caliContext.createMediaStreamSource(caliStream);
+            caliAnalyser = caliContext.createAnalyser();
+            caliAnalyser.fftSize = 2048;
+            source.connect(caliAnalyser);
+            
+            runCalibrationStep();
+        } catch(e) {
+            alert("需要麦克风权限进行校准");
+        }
+    }
+    
+    function runCalibrationStep() {
+        if (caliStep >= 7) {
+            finishCalibration();
+            return;
+        }
+        
+        document.getElementById('cali-text').innerText = `请哼唱: ${CALI_NOTES[caliStep]}`;
+        document.querySelectorAll('.cali-dot').forEach((d, i) => {
+            d.classList.toggle('active', i <= caliStep);
+        });
+        
+        noteStableCount = 0;
+        checkPitch();
+    }
+    
+    function checkPitch() {
+        if (caliStep >= 7) return;
+        const buffer = new Uint8Array(caliAnalyser.frequencyBinCount);
+        caliAnalyser.getByteTimeDomainData(buffer);
+        
+        let sum = 0;
+        for(let i=0; i<buffer.length; i++) {
+            const v = (buffer[i] - 128) / 128;
+            sum += v*v;
+        }
+        const rms = Math.sqrt(sum / buffer.length);
+        
+        const circle = document.getElementById('cali-circle');
+        const scale = 0.5 + rms * 3;
+        circle.style.transform = `scale(${scale})`;
+        
+        if (rms > 0.05) {
+            circle.style.backgroundColor = '#ffd700';
+            circle.style.opacity = '1';
+            noteStableCount++;
+            if (noteStableCount > 50) {
+                caliStep++;
+                runCalibrationStep();
+                return;
+            }
+        } else {
+            circle.style.backgroundColor = '#555';
+            circle.style.opacity = '0.5';
+            noteStableCount = Math.max(0, noteStableCount - 1);
+        }
+        
+        caliAnimFrame = requestAnimationFrame(checkPitch);
+    }
+    
+    function finishCalibration() {
+        cancelAnimationFrame(caliAnimFrame);
+        if(caliStream) caliStream.getTracks().forEach(t => t.stop());
+        if(caliContext) caliContext.close();
+        
+        document.getElementById('calibration-overlay').classList.add('hidden-fade');
+        document.getElementById('main-layout').classList.remove('blurred');
+        setTimeout(() => {
+            document.getElementById('calibration-overlay').style.display = 'none';
+        }, 1000);
+    }
+
+    // --- Dynamic Hint Logic ---
+    const RECORDING_HINTS = [
+        "注意录制环境无噪音干扰",
+        "保持一个音色效果或更佳",
+        "放慢节奏更准确",
+        "注意下方采集圆变绿即可",
+        "及时下载退出后就找不到咯",
+        "贴近麦克风一点"
+    ];
+    let hintTimer = null;
+
+    function startHintLoop() {
+        const container = document.getElementById('dynamic-hint-container');
+        let idx = 0;
+        const setHtml = (text) => {
+            container.innerHTML = `
+                <div class="text-xl font-serif text-yellow-100 mb-2 tracking-wider">录制小贴士</div>
+                <div class="text-yellow-400 font-bold text-2xl mt-1 block">${text}</div>
+            `;
+        };
+        setHtml(RECORDING_HINTS[0]);
+        hintTimer = setInterval(() => {
+            container.style.opacity = '0';
+            setTimeout(() => {
+                idx = (idx + 1) % RECORDING_HINTS.length;
+                setHtml(RECORDING_HINTS[idx]);
+                container.style.opacity = '1';
+            }, 500);
+        }, 2500);
+    }
+
+    function stopHintLoop() {
+        clearInterval(hintTimer);
+        const container = document.getElementById('dynamic-hint-container');
+        container.style.opacity = '1';
+        container.innerHTML = `
+            <div class="text-2xl font-serif text-yellow-100 mb-2 tracking-wider">慢慢哼唱</div>
+            <div class="text-yellow-400 font-bold text-3xl mt-2 block">感受当下</div>
+        `;
+    }
+
     // --- 1. Worker Script (DSP Core) ---
     const workerCode = `
         self.onmessage = function(e) {
@@ -694,6 +863,8 @@
         if(document.getElementById('panel-hum').classList.contains('hidden')) return;
         try {
             document.getElementById('recording-hint-overlay').classList.add('show');
+            startHintLoop(); // Start dynamic text cycle
+
             const s = await navigator.mediaDevices.getUserMedia({
                 audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000 }
             });
@@ -708,6 +879,7 @@
         } catch(e) { 
             alert("Mic Error: " + e.message); 
             document.getElementById('recording-hint-overlay').classList.remove('show');
+            stopHintLoop();
         }
     }
     function stopRec() { 
@@ -716,6 +888,7 @@
             micBtn.classList.remove('recording'); 
             stopVisualizer();
             document.getElementById('recording-hint-overlay').classList.remove('show');
+            stopHintLoop(); // Stop text cycle
         } 
     }
     
@@ -842,11 +1015,11 @@
     }
     window.setMode = setMode;
     
-    // --- 修复的 GenerateFromText (Maestro Edition) ---
     function generateFromText() {
         const val = document.getElementById('text-input').value.trim();
         if (!val) return;
         let notes = [];
+        const mode = window.inputMode || 'search';
 
         // Unlock audio context
         initAudio();
@@ -858,42 +1031,27 @@
         source.start(0);
 
         if (SCORE_LIB[val]) {
-            // 已收录曲目：直接解析
             notes = parseScore(SCORE_LIB[val].score);
         } else {
-            // 未收录曲目：AI 乐理生成 (Music Theory Model)
-            // 确保生成好听的旋律 (C Major / I-IV-V-vi)
-            const chords = [
-                [60, 64, 67], // C (I)
-                [65, 69, 72], // F (IV)
-                [67, 71, 62], // G (V)
-                [69, 72, 64]  // Am (vi)
-            ];
+            // 严谨的五声音阶算法 (Pentatonic Scale)
+            // C Major Pentatonic: C(0), D(2), E(4), G(7), A(9)
+            const pentaScale = [0, 2, 4, 7, 9];
+            const root = 60; // C4
             
-            // 4 bars
-            for (let bar = 0; bar < 4; bar++) {
-                const chord = chords[bar % 4];
-                let beat = 0;
-                while (beat < 4) {
-                    // Choose chord tone or passing tone
-                    let midi = chord[Math.floor(Math.random() * chord.length)];
-                    // Add some passing tones (pentatonic)
-                    if (Math.random() > 0.7) {
-                        const penta = [60, 62, 64, 67, 69];
-                        midi = penta[Math.floor(Math.random()*penta.length)];
-                    }
-                    
-                    // Octave variation
-                    if (Math.random() > 0.8) midi += 12;
-                    if (Math.random() > 0.9) midi -= 12;
+            for (let i = 0; i < 16; i++) {
+                 // Random note from pentatonic
+                 let deg = pentaScale[Math.floor(Math.random() * pentaScale.length)];
+                 let octaveOffset = Math.floor(Math.random() * 2) * 12; // 0 or +1 octave
+                 let midi = root + deg + octaveOffset;
+                 
+                 // Smart duration (syncopation)
+                 let dur = Math.random() > 0.7 ? 1.0 : 0.5;
+                 // Add velocity variation
+                 let vel = 0.6 + Math.random() * 0.3;
 
-                    const dur = Math.random() > 0.6 ? 0.5 : 1.0;
-                    if (beat + dur > 4) continue; // Don't overflow bar
-
-                    const name = KEY_NAMES_MAIN[midi%12] + (Math.floor(midi/12)-1);
-                    notes.push({ note: name, duration: dur, velocity: 0.6 + Math.random()*0.3 });
-                    beat += dur;
-                }
+                 let name = KEY_NAMES_MAIN[midi%12] + (Math.floor(midi/12)-1);
+                 
+                 notes.push({ note: name, duration: dur, velocity: vel });
             }
         }
         
@@ -901,7 +1059,6 @@
     }
     window.generateFromText = generateFromText;
 
-    // 解析简谱 (支持 1 0.5 格式)
     function parseScore(str) {
         const tokens = str.split(/\s+/);
         const notes = [];
@@ -909,10 +1066,9 @@
             let t = tokens[i];
             if (/[1-7]/.test(t)) {
                 const map = { '1': 0, '2': 2, '3': 4, '4': 5, '5': 7, '6': 9, '7': 11 };
-                let m = 72 + map[t.match(/[1-7]/)[0]]; // C5 Base
+                let m = 72 + map[t.match(/[1-7]/)[0]]; 
                 if (t.includes('-')) m -= 12;
                 if (t.includes('+')) m += 12;
-                
                 let dur = 0.5;
                 if (i + 1 < tokens.length && /^[0-9.]+$/.test(tokens[i+1])) {
                     dur = parseFloat(tokens[i+1]);
@@ -936,7 +1092,6 @@
         if (item) { const a = document.createElement('a'); a.href = URL.createObjectURL(item.blob); a.download = `${item.title}.mp3`; a.click(); }
     };
 
-    // --- 修复的五线谱绘制 (Maestro Engine) ---
     window.downloadSheetMusicPDF = (id) => { 
         const targetId = typeof id === 'number' ? id : (historyList.length > 0 ? historyList[0].id : null);
         if (!targetId) return;
@@ -947,6 +1102,7 @@
         const doc = new jsPDF('l','mm','a4');
         doc.setFontSize(22); doc.text(item.title, 148, 20, {align:"center"});
         
+        // --- 乐谱渲染 (Notation Logic) ---
         const staffYBase = 60;
         const lineH = 2.5; 
         const staffW = 260; 
